@@ -11,8 +11,17 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
-#define SERVER_PORT		9999
+typedef struct {
+    char server_root[256];
+    int max_clients;
+    int listen_port;
+    char server_signature[256];
+}ServerConfig;
+
+ServerConfig config;
+
 #define MAXBUF		1024
 char buffer[MAXBUF];
 
@@ -59,9 +68,30 @@ int procesarPeticion(int fd){
     return 0;
 }
 
+void leer_configuracion(){
+    // Leemos la configuración del servidor desde el archivo server.conf
+    FILE *config_file = fopen("server.conf", "r");
+    if(!config_file){
+        perror("Error al abrir el archivo de configuración");
+        exit(errno);
+    }
+    
+    char line[512];
+    while(fgets(line, sizeof(line), config_file)){
+        if(sscanf(line, "server_root = %s", config.server_root) == 1) continue;
+        if(sscanf(line, "max_clients = %d", &config.max_clients) == 1) continue;
+        if(sscanf(line, "listen_port = %d", &config.listen_port) == 1) continue;
+        if(sscanf(line, "server_signature = %s", config.server_signature) == 1) continue;
+    }
+    
+    fclose(config_file);
+}
+
 int main(void)
 {   int sockfd;
 	struct sockaddr_in self;
+
+    leer_configuracion();
 	
 
 	// Creamos el socket tipo TCP */
@@ -74,7 +104,7 @@ int main(void)
 	// Inicializamos estructura de dirección y puerto
 	bzero(&self, sizeof(self));
 	self.sin_family = AF_INET;
-	self.sin_port = htons(SERVER_PORT);
+	self.sin_port = htons(config.listen_port);
 	self.sin_addr.s_addr = INADDR_ANY;
 
 	// Ligamos puerto al socket
@@ -93,24 +123,39 @@ int main(void)
 	
 	printf("Escuchando en [%s:%d]...\n", inet_ntoa(self.sin_addr), ntohs(self.sin_port));
 
-	while (1)
-	{	int clientfd;
-		struct sockaddr_in client_addr;
-		int addrlen=sizeof(client_addr);
+    for(int i = 0; i < config.max_clients; i++){
+        pid_t pid = fork();
+        
+        if(pid == 0){
+            // Proceso hijo (trabajador)
+            while (1)
+            {	int clientfd;
+                struct sockaddr_in client_addr;
+                // Usamos socklen_t para evitar warnings en accept()
+                socklen_t addrlen = sizeof(client_addr);
 
-		// Aceptamos conexiones
-		clientfd = accept(sockfd, (struct sockaddr*)&client_addr, &addrlen);
-		printf("Conexión desde [%s:%d]\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+                // El hijo se queda bloqueado aquí esperando clientes
+                clientfd = accept(sockfd, (struct sockaddr*)&client_addr, &addrlen);
+                if(clientfd < 0) continue; // Si hay error, seguimos esperando
 
-        if(fork()==0){
-            //hijo procesamos la petición
-            procesarPeticion(clientfd);
-            exit(0);
+                printf("[Proceso %d] Conexión desde [%s:%d]\n", getpid(), inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+
+                // Procesamos la petición del cliente
+                procesarPeticion(clientfd);
+
+                // Cerramos la conexióncon el cliente y volvemos al accept()
+                close(clientfd);
+            }
+            exit(0); // Nunca debería llegar aquí por el while(1)
         }
+        else if(pid < 0){
+            perror("Error al hacer fork");
+        }
+    }
 
-		// Cerramos la conexión
-		close(clientfd);
-	}
+    // Código del proceso padre
+    //El padre no atiende a peticiones, solo espera indefinidamente a que los hijos terminen (lo cual no ocurrirá en este caso) así evita zombies
+    while(wait(NULL) > 0);
 
 	close(sockfd);
 	return 0;
