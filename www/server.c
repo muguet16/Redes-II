@@ -11,6 +11,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <sys/wait.h>
 #include "picohttpparser.h"
 
@@ -36,6 +38,19 @@ const char* obtener_content_type(const char* ruta) {
     if (strstr(ruta, ".pdf")) return "application/pdf";
     // Tipo por defecto para descargar si no lo reconoce
     return "application/octet-stream"; 
+}
+
+void obtener_fecha_http(char *buffer, size_t size, time_t *t) {
+    struct tm *tm_info;
+    // Si t es NULL, cogemos la hora actual. Si no, cogemos la hora que nos pasen.
+    if (t == NULL) {
+        time_t ahora = time(NULL);
+        tm_info = gmtime(&ahora);
+    } else {
+        tm_info = gmtime(t);
+    }
+    // Formateamos la fecha según el estándar RFC 1123
+    strftime(buffer, size, "%a, %d %b %Y %H:%M:%S GMT", tm_info);
 }
 
 void ejecutar_script(int client_fd, const char *ruta_script, const char *argumentos, const char *interprete) {
@@ -73,8 +88,9 @@ void ejecutar_script(int client_fd, const char *ruta_script, const char *argumen
         }
         close(pipe_in[1]); // Hay que cerrarlo para que el script sepa que ya no hay más argumentos
 
-        // 2. Enviamos la línea de estado HTTP al cliente
-        char *status_line = "HTTP/1.1 200 OK\r\n";
+        // 2. Enviamos la línea de estado HTTP y cabeceras completas al cliente
+        char status_line[512];
+        sprintf(status_line, "HTTP/1.1 200 OK\r\nServer: %s\r\nContent-Type: text/html\r\n\r\n", config.server_signature);
         send(client_fd, status_line, strlen(status_line), 0);
 
         // 3. Leemos lo que el script imprime por pantalla y se lo pasamos directo al cliente
@@ -91,7 +107,7 @@ void ejecutar_script(int client_fd, const char *ruta_script, const char *argumen
 }
 
 int procesarPeticion(int fd){
-    char buf[4096];
+    char buf[4097]; // Buffer para recibir la petición (un poco más grande que el máximo para detectar overflow)
     int rret, pret;
     size_t buflen = 0, prevbuflen = 0;
 
@@ -105,7 +121,11 @@ int procesarPeticion(int fd){
     while(1){
         rret = recv(fd, buf + buflen, sizeof(buf) - buflen, 0);
         if(rret <= 0) return rret; // Error o conexión cerrada por el cliente
+        prevbuflen = buflen;
         buflen += rret;
+
+        // --- LA MAGIA: Cortamos el string exactamente donde acaban los datos ---
+        buf[buflen] = '\0';
 
         //intentamos parsear lo que tenemos en el buffer
         num_headers = sizeof(headers) / sizeof(headers[0]);
@@ -160,10 +180,31 @@ int procesarPeticion(int fd){
             // 4. Si no es un script, es un archivo estático normal
             FILE *file = fopen(real_path, "rb");
             if (file) {
+                // 1. Obtenemos información del archivo (peso y fecha de modificación)
+                struct stat st;
+                stat(real_path, &st);
+                long content_length = st.st_size;
+
+                // 2. Preparamos las fechas
+                char date_header[128];
+                obtener_fecha_http(date_header, sizeof(date_header), NULL); // Fecha actual
+                
+                char modified_header[128];
+                obtener_fecha_http(modified_header, sizeof(modified_header), &st.st_mtime); // Fecha del archivo
+
                 const char* content_type = obtener_content_type(real_path);
-                char response[512];
-                sprintf(response, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nServer: %s\r\n\r\n", 
-                        content_type, config.server_signature);
+                
+                // 3. Enviamos el 200 OK con TODAS las cabeceras exigidas
+                char response[1024];
+                sprintf(response, 
+                        "HTTP/1.1 200 OK\r\n"
+                        "Server: %s\r\n"
+                        "Date: %s\r\n"
+                        "Last-Modified: %s\r\n"
+                        "Content-Length: %ld\r\n"
+                        "Content-Type: %s\r\n\r\n", 
+                        config.server_signature, date_header, modified_header, content_length, content_type);
+                
                 send(fd, response, strlen(response), 0);
                 
                 char filecontent[4096];
@@ -179,6 +220,50 @@ int procesarPeticion(int fd){
                 send(fd, response, strlen(response), 0);
             }
         }
+    }
+    else if (strcmp(method_str, "POST") == 0) {
+        char real_path[512];
+
+        //Limpiamos la URL por si vienen variables GET mezcladas
+        char *interrogacion = strchr(path_str, '?');
+        if (interrogacion != NULL) {
+            *interrogacion = '\0'; 
+        }
+
+        sprintf(real_path, "%s%s", config.server_root, path_str + 1);
+
+        // En POST, los argumentos van en el cuerpo.
+        // El cuerpo empieza justo donde terminan las cabeceras (pret).
+        char *argumentos = buf + pret;
+        
+        // Si no se leyeron argumentos completos en el primer recv, 
+        // para la práctica básica bastará con los que haya en el buffer.
+        
+        if (strstr(real_path, ".py") != NULL) {
+            printf("[CGI POST] Ejecutando Python: %s | Args: %s\n", real_path, argumentos);
+            ejecutar_script(fd, real_path, argumentos, "python3");
+        } 
+        else if (strstr(real_path, ".php") != NULL) {
+            printf("[CGI POST] Ejecutando PHP: %s | Args: %s\n", real_path, argumentos);
+            ejecutar_script(fd, real_path, argumentos, "php");
+        } 
+        else {
+            // Un POST a un archivo que no es script suele ser un error 405
+            char response[512];
+            sprintf(response, "HTTP/1.1 405 Method Not Allowed\r\nServer: %s\r\n\r\n", config.server_signature);
+            send(fd, response, strlen(response), 0);
+        }
+    } 
+    else if (strcmp(method_str, "OPTIONS") == 0) {
+        char response[512];
+        sprintf(response, "HTTP/1.1 200 OK\r\nAllow: GET, POST, OPTIONS\r\nServer: %s\r\nContent-Length: 0\r\n\r\n", config.server_signature);
+        send(fd, response, strlen(response), 0);
+    } 
+    else {
+        // Si piden PUT, DELETE u otro verbo no soportado -> 400 Bad Request
+        char response[512];
+        sprintf(response, "HTTP/1.1 400 Bad Request\r\nServer: %s\r\n\r\n", config.server_signature);
+        send(fd, response, strlen(response), 0);
     }
 }
 
