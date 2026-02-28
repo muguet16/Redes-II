@@ -119,7 +119,7 @@ int procesarPeticion(int fd){
     size_t num_headers;
 
     while(1){
-        rret = recv(fd, buf + buflen, sizeof(buf) - buflen, 0);
+        rret = recv(fd, buf + buflen, sizeof(buf) - buflen -1, 0);
         if(rret <= 0) return rret; // Error o conexión cerrada por el cliente
         prevbuflen = buflen;
         buflen += rret;
@@ -265,6 +265,7 @@ int procesarPeticion(int fd){
         sprintf(response, "HTTP/1.1 400 Bad Request\r\nServer: %s\r\n\r\n", config.server_signature);
         send(fd, response, strlen(response), 0);
     }
+    return 0;
 }
 
 void leer_configuracion(){
@@ -280,7 +281,7 @@ void leer_configuracion(){
         if(sscanf(line, "server_root = %s", config.server_root) == 1) continue;
         if(sscanf(line, "max_clients = %d", &config.max_clients) == 1) continue;
         if(sscanf(line, "listen_port = %d", &config.listen_port) == 1) continue;
-        if(sscanf(line, "server_signature = %s", config.server_signature) == 1) continue;
+        if(sscanf(line, "server_signature = %[^\n]", config.server_signature) == 1) continue;
     }
     
     fclose(config_file);
