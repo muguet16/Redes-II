@@ -38,7 +38,57 @@ const char* obtener_content_type(const char* ruta) {
     return "application/octet-stream"; 
 }
 
+void ejecutar_script(int client_fd, const char *ruta_script, const char *argumentos, const char *interprete) {
+    int pipe_in[2];  // Para enviar los argumentos al stdin del script
+    int pipe_out[2]; // Para leer el stdout del script
 
+    pipe(pipe_in);
+    pipe(pipe_out);
+
+    pid_t pid = fork();
+
+    if (pid == 0) { 
+        // --- PROCESO HIJO (Ejecutará el script) ---
+        close(pipe_in[1]);  // Cierra el extremo de escritura
+        close(pipe_out[0]); // Cierra el extremo de lectura
+
+        // Redirigir la entrada estándar (stdin) y salida estándar (stdout) hacia las tuberías
+        dup2(pipe_in[0], STDIN_FILENO);
+        dup2(pipe_out[1], STDOUT_FILENO);
+
+        // Ejecutar el intérprete (python o php) pasándole la ruta del script
+        execlp(interprete, interprete, ruta_script, NULL);
+        
+        // Si llega aquí, es que execlp falló
+        perror("Error al ejecutar el script");
+        exit(1);
+    } else {
+        // --- PROCESO PADRE (El servidor Web) ---
+        close(pipe_in[0]);
+        close(pipe_out[1]);
+
+        // 1. Le enviamos los argumentos al script por su entrada estándar
+        if (argumentos != NULL) {
+            write(pipe_in[1], argumentos, strlen(argumentos));
+        }
+        close(pipe_in[1]); // Hay que cerrarlo para que el script sepa que ya no hay más argumentos
+
+        // 2. Enviamos la línea de estado HTTP al cliente
+        char *status_line = "HTTP/1.1 200 OK\r\n";
+        send(client_fd, status_line, strlen(status_line), 0);
+
+        // 3. Leemos lo que el script imprime por pantalla y se lo pasamos directo al cliente
+        char buffer[4096];
+        int bytes_leidos;
+        while ((bytes_leidos = read(pipe_out[0], buffer, sizeof(buffer))) > 0) {
+            send(client_fd, buffer, bytes_leidos, 0);
+        }
+        close(pipe_out[0]);
+        
+        // Esperamos a que el script termine completamente
+        waitpid(pid, NULL, 0); 
+    }
+}
 
 int procesarPeticion(int fd){
     char buf[4096];
@@ -79,41 +129,56 @@ int procesarPeticion(int fd){
 
     //Lógica de respuesta
     //Solo vamos a procesar GET por ahora
-    if (strcmp(method_str, "GET") == 0){
-        //construimos ruta real: config.server_root + ruta perdida
+    if (strcmp(method_str, "GET") == 0) {
         char real_path[512];
-        //si pide "/", le damos el index.html
-        if (strcmp(path_str, "/") == 0){
+        char *argumentos = NULL;
+        
+        // 1. Separar la ruta de los argumentos (si los hay)
+        char *interrogacion = strchr(path_str, '?');
+        if (interrogacion != NULL) {
+            *interrogacion = '\0'; // Cortamos el string de la ruta aquí
+            argumentos = interrogacion + 1; // Los argumentos son lo que va después del '?'
+        }
+
+        // 2. Construir la ruta física
+        if (strcmp(path_str, "/") == 0) {
             sprintf(real_path, "%sindex.html", config.server_root);
-        }else{
-            sprintf(real_path, "%s%s", config.server_root, path_str + 1); // +1 para eliminar la barra inicial que ya tenemos en server_root
+        } else {
+            sprintf(real_path, "%s%s", config.server_root, path_str + 1);
         }
 
-        FILE *file = fopen(real_path, "rb"); //rb para leer binario (imágenes, etc)
-
-        if(file){
-            //obtenemos el tipo MIME correcto
-            const char* content_type = obtener_content_type(real_path);
-            //enviamos cabecera HTTP 200 OKç
-            char response[512];
-            sprintf(response, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nServer: %s\r\n\r\n", content_type, config.server_signature);
-            send(fd, response, strlen(response), 0);
-
-            //enviamos el contenido del archivo
-            char filecontent[1024];
-            int bytes;
-            while((bytes = fread(filecontent, 1, sizeof(filecontent), file)) > 0){
-                send(fd, filecontent, bytes, 0);
+        // 3. Comprobar si es un script
+        if (strstr(real_path, ".py") != NULL) {
+            printf("[CGI] Ejecutando script Python: %s con args: %s\n", real_path, argumentos);
+            ejecutar_script(fd, real_path, argumentos, "python3"); // O usar "python" según tu sistema
+        } 
+        else if (strstr(real_path, ".php") != NULL) {
+            printf("[CGI] Ejecutando script PHP: %s con args: %s\n", real_path, argumentos);
+            ejecutar_script(fd, real_path, argumentos, "php");
+        } 
+        else {
+            // 4. Si no es un script, es un archivo estático normal
+            FILE *file = fopen(real_path, "rb");
+            if (file) {
+                const char* content_type = obtener_content_type(real_path);
+                char response[512];
+                sprintf(response, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nServer: %s\r\n\r\n", 
+                        content_type, config.server_signature);
+                send(fd, response, strlen(response), 0);
+                
+                char filecontent[4096];
+                int bytes;
+                while ((bytes = fread(filecontent, 1, sizeof(filecontent), file)) > 0) {
+                    send(fd, filecontent, bytes, 0);
+                }
+                fclose(file);
+            } else {
+                char response[512];
+                sprintf(response, "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nServer: %s\r\n\r\n<h1>404 Not Found</h1>", 
+                        config.server_signature);
+                send(fd, response, strlen(response), 0);
             }
-            fclose(file);
-        }else{
-            //error 404 not found
-            char response[512];
-            sprintf(response, "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nServer: %s\r\n\r\n<h1>404 Not found</h1>", config.server_signature);
-            send(fd, response, strlen(response), 0);
         }
-        //Aquí estarán el POST, PUT, etc en el futuro
-        return 0;
     }
 }
 
