@@ -1,11 +1,8 @@
 # Memoria Técnica - Práctica 1: Servidor Web (Redes II)
 
 ## 1. Introducción
-El presente documento detalla el diseño, arquitectura y desarrollo de un servidor web concurrente escrito en C, correspondiente a la Práctica 1 de la asignatura de Redes de Comunicación II. 
 
 El objetivo principal ha sido construir un servidor HTTP/1.1 robusto y funcional desde cero, capaz de procesar peticiones concurrentes, servir contenido estático (texto, imágenes, vídeos) con sus correspondientes tipos MIME y cabeceras, y ejecutar contenido dinámico (CGI) mediante scripts en Python y PHP. Todo ello respetando estándares de ingeniería de software, empaquetado mediante *Makefiles*, estructuración modular y control estricto de memoria (garantizando cero fugas según las pruebas de Valgrind).
-
----
 
 ## 2. Documentos de Diseño
 
